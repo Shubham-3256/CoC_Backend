@@ -270,17 +270,6 @@ app.get("/raw/*", (req, res) => {
   return cocFetch(rawPath, req, res, { cacheKey: `raw:${rawPath}:${req.originalUrl}` });
 });
 
-app.get("/my-ip", async (req, res) => {
-  try {
-    const r = await fetch("https://api64.ipify.org?format=json");
-    const j = await r.json();
-    res.json(j);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-
 /* --- 404 --- */
 app.use((req, res) => res.status(404).json({ error: "Not found" }));
 
