@@ -236,6 +236,87 @@ app.get("/clan/:tag/members", wrap(async (req, res) => {
   return cocFetch(`/clans/${tag}/members`, req, res, { cacheKey: `members:${tag}` });
 }));
 
+// Aggregated clan statistics (derived server-side)
+app.get(
+  '/clan/:tag/stats',
+  wrap(async (req, res) => {
+    const tag = validateTagParam(req.params.tag);
+    // Fetch clan and members
+    const clanResp = await cocFetch(`/clans/${encodeTag(tag)}`, req, res, {
+      cacheKey: `clan:${tag}:info`,
+    });
+    const membersResp = await cocFetch(`/clans/${encodeTag(tag)}/members`, req, res, {
+      cacheKey: `clan:${tag}:members`,
+    });
+
+    // If upstream returned an error wrapper, forward it
+    if (!clanResp || !membersResp) {
+      return res.status(502).json({ error: 'Failed to fetch clan data' });
+    }
+
+    const clan = clanResp.data || {};
+    const members = membersResp.data?.items || [];
+
+    // Compute basic aggregated stats
+    const totalMembers = members.length;
+    const totalTrophies = members.reduce((s, m) => s + (m.trophies || 0), 0);
+    const avgTrophies = totalMembers > 0 ? Math.round(totalTrophies / totalMembers) : 0;
+    const highest = totalMembers > 0 ? Math.max(...members.map((m) => m.trophies || 0)) : 0;
+    const lowest = totalMembers > 0 ? Math.min(...members.map((m) => m.trophies || 0)) : 0;
+
+    // Trophies distribution buckets
+    const brackets = [
+      { name: '3000+', min: 3000, count: 0 },
+      { name: '2500-2999', min: 2500, max: 2999, count: 0 },
+      { name: '2000-2499', min: 2000, max: 2499, count: 0 },
+      { name: '1500-1999', min: 1500, max: 1999, count: 0 },
+      { name: '1000-1499', min: 1000, max: 1499, count: 0 },
+      { name: '<1000', min: 0, max: 999, count: 0 },
+    ];
+
+    members.forEach((m) => {
+      const t = m.trophies || 0;
+      if (t >= 3000) brackets[0].count++;
+      else if (t >= 2500) brackets[1].count++;
+      else if (t >= 2000) brackets[2].count++;
+      else if (t >= 1500) brackets[3].count++;
+      else if (t >= 1000) brackets[4].count++;
+      else brackets[5].count++;
+    });
+
+    return res.json({
+      clan: { tag: clan.tag, name: clan.name, level: clan.clanLevel },
+      totalMembers,
+      avgTrophies,
+      highest,
+      lowest,
+      trophyDistribution: brackets,
+    });
+  })
+);
+
+// Clan donations aggregate
+app.get(
+  '/clan/:tag/donations',
+  wrap(async (req, res) => {
+    const tag = validateTagParam(req.params.tag);
+    const membersResp = await cocFetch(`/clans/${encodeTag(tag)}/members`, req, res, {
+      cacheKey: `clan:${tag}:members`,
+    });
+
+    if (!membersResp) return res.status(502).json({ error: 'Failed to fetch members' });
+
+    const members = membersResp.data?.items || [];
+
+    const totalDonations = members.reduce((s, m) => s + (m.donations || 0) + (m.donated || 0), 0);
+    const perMember = members.map((m) => ({ tag: m.tag, name: m.name, donated: m.donated || 0, donations: m.donations || 0 }));
+
+    perMember.sort((a, b) => (b.donated || 0) - (a.donated || 0));
+
+    return res.json({ totalDonations, members: perMember });
+  })
+);
+
 app.get("/clan/:tag/warlog", wrap(async (req, res) => {
   const v = validateTagParam(req.params.tag);
   if (!v.ok) return res.status(400).json({ error: "invalid_tag", reason: v.reason, requestId: req.requestId });
