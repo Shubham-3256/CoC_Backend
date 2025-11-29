@@ -52,11 +52,17 @@ function validateTag(tag) {
   return { ok: true }
 }
 
-function encodeTag(tag) {
-  tag = tag.toUpperCase()
-  if (!tag.startsWith("#")) tag = `#${tag}`
+function encodeTag(rawTag) {
+  if (!rawTag) return ''
+
+  // Decode first so it works with "%23TAG" and "#TAG" and "TAG"
+  let tag = decodeURIComponent(rawTag).trim().toUpperCase()
+
+  if (!tag.startsWith('#')) tag = `#${tag}`
+
   return encodeURIComponent(tag)
 }
+
 
 function wrap(fn) {
   return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
