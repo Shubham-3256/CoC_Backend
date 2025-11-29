@@ -1,270 +1,392 @@
-// server.js — Improved error handling + configurable
-// Based on your previous server.js. Keeps no added npm deps.
-// Reference: original server.js used as base. :contentReference[oaicite:1]{index=1}
+// server.js
+require('dotenv').config()
 
-import express from "express";
-import dotenv from "dotenv";
-import morgan from "morgan";
-import helmet from "helmet";
-import compression from "compression";
-import rateLimit from "express-rate-limit";
-import NodeCache from "node-cache";
+const express = require('express')
+const cors = require('cors')
+const helmet = require('helmet')
+const morgan = require('morgan')
 
-dotenv.config();
+const app = express()
 
-const app = express();
-const PORT = Number(process.env.PORT || 4000);
-const COC_API = "https://api.clashofclans.com/v1";
-const TOKEN = process.env.COC_TOKEN;
+// ==== Config ====
+const PORT = process.env.PORT || 3000
+const COC_API = process.env.COC_API_BASE || 'https://api.clashofclans.com/v1'
+const TOKEN = process.env.COC_API_TOKEN
+const CACHE_TTL = Number(process.env.CACHE_TTL || 30) * 1000 // ms
+const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 6000)
 
 if (!TOKEN) {
-  console.error("❌ Missing COC_TOKEN. Add it in Render dashboard under Environment Variables.");
-  process.exit(1);
+  console.warn('⚠️  COC_API_TOKEN not set! Set it in .env')
 }
 
-// feature flags / config (easy to extend)
-const DEBUG = (process.env.DEBUG || "false").toLowerCase() === "true";
-const ALLOW_RAW_PROXY = (process.env.ALLOW_RAW_PROXY || "false").toLowerCase() === "true";
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "*").split(",").map(s => s.trim());
-const CACHE_TTL = Number(process.env.CACHE_TTL_SECONDS || 30);
-const RATE_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 15000);
-const RATE_MAX = Number(process.env.RATE_LIMIT_MAX || 100);
-const JSON_LIMIT = process.env.JSON_BODY_LIMIT || "10kb";
+// ==== Basic middleware ====
+app.use(helmet())
+app.use(cors())
+app.use(express.json())
+app.use(
+  morgan('dev', {
+    skip: (req) => req.path === '/health',
+  })
+)
 
-// small in-memory metrics (useful before adding real metrics)
-const metrics = {
-  totalRequests: 0,
-  successes: 0,
-  errors: 0,
-  cacheHits: 0,
-  lastError: null,
-};
-
-// simple console logger respecting DEBUG flag
-function log(...args) {
-  if (DEBUG) console.debug(...args);
-}
-function info(...args) {
-  console.log(...args);
-}
-function warn(...args) {
-  console.warn(...args);
-}
-function errorLog(...args) {
-  console.error(...args);
-  metrics.lastError = { when: Date.now(), msg: args.map(a => String(a)).join(" ") };
-}
-
-// ---------- polyfill fetch if not present ----------
-const fetchFn = global.fetch || (await import("node-fetch")).default;
-
-// ---------- middleware ----------
-app.use(helmet());
-app.use(compression());
-app.use(express.json({ limit: JSON_LIMIT }));
-app.use(morgan(process.env.MORGAN_FORMAT || (DEBUG ? "dev" : "combined")));
-
-// CORS
+// attach requestId for easier debugging (very simple)
 app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (ALLOWED_ORIGINS.includes("*") || (origin && ALLOWED_ORIGINS.includes(origin))) {
-    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  req.requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  next()
+})
+
+// ==== Simple in-memory cache ====
+const cacheStore = new Map()
+
+function cacheGet(key) {
+  const entry = cacheStore.get(key)
+  if (!entry) return null
+  if (Date.now() > entry.expiresAt) {
+    cacheStore.delete(key)
+    return null
   }
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,X-Request-Id");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
-
-// rate limiter (basic)
-app.use(rateLimit({
-  windowMs: RATE_WINDOW_MS,
-  max: RATE_MAX,
-  standardHeaders: true,
-}));
-
-// NodeCache (in-memory) - easy to swap to Redis later
-const cache = new NodeCache({ stdTTL: CACHE_TTL });
-
-// ---------- helpers ----------
-
-// generate simple request id (timestamp + short random)
-function makeRequestId() {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,9)}`;
+  return entry.value
 }
 
-// wrap async route handlers to forward errors to central handler
-const wrap = (fn) => (req, res, next) => {
-  const requestId = makeRequestId();
-  req.requestId = requestId;
-  res.setHeader("X-Request-Id", requestId);
-  metrics.totalRequests += 1;
-  Promise.resolve(fn(req, res, next)).catch(next);
-};
+function cacheSet(key, value, ttlMs = CACHE_TTL) {
+  cacheStore.set(key, {
+    value,
+    expiresAt: Date.now() + ttlMs,
+  })
+}
 
-// basic param validator for Clash tags (server expects encoded '#TAG' later)
+// ==== Helpers ====
+
+/**
+ * Encode clan/player tag for CoC API.
+ * Accepts:
+ *  - "#TAG"
+ *  - "TAG"
+ *  - "%23TAG" (Express decodes this to "#TAG" already)
+ */
+function encodeTag(raw) {
+  if (!raw) return ''
+  let tag = raw.trim().toUpperCase()
+  if (!tag.startsWith('#')) tag = `#${tag}`
+  return encodeURIComponent(tag)
+}
+
+/**
+ * Validate a tag param.
+ */
 function validateTagParam(raw) {
-  if (!raw || typeof raw !== "string") return { ok: false, reason: "missing tag" };
-  // allow letters, numbers, #, %, - and up to 40 chars (safe limit)
-  if (!/^[#%0-9A-Za-z\-]+$/.test(raw)) return { ok: false, reason: "invalid characters in tag" };
-  if (raw.length > 40) return { ok: false, reason: "tag too long" };
-  return { ok: true };
+  if (!raw || typeof raw !== 'string') {
+    return { ok: false, reason: 'tag_missing' }
+  }
+  const trimmed = raw.trim()
+  if (!trimmed.length) {
+    return { ok: false, reason: 'tag_empty' }
+  }
+  return { ok: true }
 }
 
-function encodeTag(tag) {
-  if (!tag) return "";
-  const withHash = tag.startsWith("#") || tag.startsWith("%23") ? tag : `#${tag}`;
-  return encodeURIComponent(withHash);
+/**
+ * Async wrapper to forward errors to Express error handler.
+ */
+function wrap(fn) {
+  return (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next)
+  }
 }
 
-// safe JSON parse, returns { ok, json, raw }
+/**
+ * Fetch with timeout using built-in fetch (Node 18+).
+ */
+async function fetchWithTimeout(resource, options = {}, timeout = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController()
+  const id = setTimeout(() => controller.abort(), timeout)
+
+  try {
+    const resp = await fetch(resource, { ...options, signal: controller.signal })
+    return resp
+  } finally {
+    clearTimeout(id)
+  }
+}
+
+/**
+ * Safe JSON parse that keeps the raw body if parsing fails.
+ */
 function safeJsonParse(text) {
   try {
-    const j = text ? JSON.parse(text) : {};
-    return { ok: true, json: j, raw: text };
-  } catch (err) {
-    return { ok: false, json: null, raw: text };
+    return { ok: true, json: JSON.parse(text) }
+  } catch {
+    return { ok: false, raw: text }
   }
 }
 
-// fetch with timeout
-async function fetchWithTimeout(url, opts = {}, timeoutMs = 6000) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
+/**
+ * Direct proxy to Clash of Clans API that writes directly to res.
+ * Use this for simple pass-through endpoints.
+ */
+async function cocFetch(path, req, res, { cacheKey = null, method = 'GET', body = null } = {}) {
   try {
-    const resp = await fetchFn(url, { ...opts, signal: controller.signal });
-    clearTimeout(id);
-    return resp;
-  } catch (err) {
-    clearTimeout(id);
-    throw err;
-  }
-}
-
-// improved cocFetch: returns response to client with proper status + structured error info
-async function cocFetch(path, req, res, { cacheKey = null, method = "GET", body = null, allowedQueryParams = [] } = {}) {
-  const requestId = req.requestId || makeRequestId();
-  try {
-    // cache short-circuit
-    if (cacheKey && method === "GET") {
-      const c = cache.get(cacheKey);
-      if (c) {
-        metrics.cacheHits += 1;
-        log(`[cache] hit ${cacheKey} req=${requestId}`);
-        return res.status(c.status).json({ ...c.body, _cached: true });
+    // GET cache
+    if (cacheKey && method === 'GET') {
+      const cached = cacheGet(cacheKey)
+      if (cached) {
+        return res.json(cached)
       }
     }
 
-    // build URL (no query builder here, add if needed)
-    const url = `${COC_API}${path}`;
+    const url = `${COC_API}${path}`
 
-    const response = await fetchWithTimeout(url, {
-      method,
-      headers: {
-        Authorization: `Bearer ${TOKEN}`,
-        Accept: "application/json",
-        "User-Agent": process.env.USER_AGENT || "clash-proxy/1.0",
+    const resp = await fetchWithTimeout(
+      url,
+      {
+        method,
+        headers: {
+          Authorization: `Bearer ${TOKEN}`,
+          Accept: 'application/json',
+          'User-Agent': process.env.USER_AGENT || 'coc-dashboard-proxy/1.0',
+          'Content-Type': body ? 'application/json' : undefined,
+        },
+        body: body ? JSON.stringify(body) : undefined,
       },
-      body: body ? JSON.stringify(body) : undefined,
-    }, Number(process.env.FETCH_TIMEOUT_MS || 6000));
+      FETCH_TIMEOUT_MS
+    )
 
-    const text = await response.text();
-    const parsed = safeJsonParse(text);
+    const text = await resp.text()
+    const parsed = safeJsonParse(text)
+    const payload = parsed.ok ? parsed.json : { raw: parsed.raw }
 
-    // if the response is not JSON, wrap raw
-    const payload = parsed.ok ? parsed.json : { raw: parsed.raw };
-
-    // If upstream returns 429 (rate limit) include retry info
-    if (response.status === 429) {
-      const retryAfter = response.headers.get("retry-after");
-      const rateInfo = { retryAfter: retryAfter || null, note: "Upstream rate-limited (429)" };
-      const bodyToSend = { error: "rate_limited", rateInfo, upstream: payload };
-      if (cacheKey) cache.set(cacheKey, { status: response.status, body: bodyToSend }, CACHE_TTL);
-      metrics.errors += 1;
-      return res.status(429).json({ ...bodyToSend, requestId });
+    if (!resp.ok) {
+      return res.status(resp.status).json({
+        error: 'upstream_error',
+        status: resp.status,
+        message: payload?.reason || payload?.message || 'Error from Clash of Clans API',
+        upstream: payload,
+        requestId: req.requestId,
+      })
     }
 
-    // cache successful GETs (200-299)
-    if (cacheKey && response.status >= 200 && response.status < 300) {
-      cache.set(cacheKey, { status: response.status, body: payload }, CACHE_TTL);
+    // write to cache
+    if (cacheKey && method === 'GET') {
+      cacheSet(cacheKey, payload)
     }
 
-    metrics.successes += 1;
-    return res.status(response.status).json({ ...payload, requestId });
+    return res.json(payload)
   } catch (err) {
-    metrics.errors += 1;
-    errorLog(`[cocFetch] req=${requestId} err=`, err && err.message ? err.message : err);
-    const isAbort = err && err.name === "AbortError";
-    const status = isAbort ? 504 : 500;
-    // Provide helpful structured error to client
+    const status = err.name === 'AbortError' ? 504 : 500
     return res.status(status).json({
-      error: isAbort ? "upstream_timeout" : "upstream_error",
-      message: err.message || "Unknown error",
-      requestId,
-    });
+      error: 'proxy_error',
+      message: err.message || 'Failed to contact Clash of Clans API',
+      requestId: req.requestId,
+    })
   }
 }
 
-// ---------- routes ----------
-// root & health
-app.get("/", (req, res) => res.send("Clash of Clans Proxy Running (improved error handling)."));
-app.get("/health", (req, res) => res.json({ status: "ok", uptime: process.uptime(), requestId: req.requestId || null }));
+/**
+ * JSON fetch from CoC API that returns data (used for aggregated endpoints).
+ */
+async function cocGetJson(path, { cacheKey = null, method = 'GET', body = null } = {}) {
+  // GET cache
+  if (cacheKey && method === 'GET') {
+    const cached = cacheGet(cacheKey)
+    if (cached) return cached
+  }
 
-// metrics for quick diagnostics
-app.get("/metrics", (req, res) => res.json(metrics));
+  const url = `${COC_API}${path}`
 
-// Search (example: keep as-is, you can extend allowedQueryParams)
-app.get("/search/clans", wrap(async (req, res) => {
-  const qs = req.query ? `?${new URLSearchParams(req.query).toString()}` : "";
-  return cocFetch(`/clans${qs}`, req, res, { cacheKey: `search:clans:${qs}` });
-}));
+  const resp = await fetchWithTimeout(
+    url,
+    {
+      method,
+      headers: {
+        Authorization: `Bearer ${TOKEN}`,
+        Accept: 'application/json',
+        'User-Agent': process.env.USER_AGENT || 'coc-dashboard-proxy/1.0',
+        'Content-Type': body ? 'application/json' : undefined,
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    },
+    FETCH_TIMEOUT_MS
+  )
 
-// Clan endpoints with validation
-app.get("/clan/:tag", wrap(async (req, res) => {
-  const v = validateTagParam(req.params.tag);
-  if (!v.ok) return res.status(400).json({ error: "invalid_tag", reason: v.reason, requestId: req.requestId });
+  const text = await resp.text()
+  const parsed = safeJsonParse(text)
+  const payload = parsed.ok ? parsed.json : { raw: parsed.raw }
 
-  const tag = encodeTag(req.params.tag);
-  return cocFetch(`/clans/${tag}`, req, res, { cacheKey: `clan:${tag}` });
-}));
+  if (!resp.ok) {
+    const err = new Error(payload?.reason || payload?.message || `Upstream error ${resp.status}`)
+    err.status = resp.status
+    err.upstream = payload
+    throw err
+  }
 
-app.get("/clan/:tag/members", wrap(async (req, res) => {
-  const v = validateTagParam(req.params.tag);
-  if (!v.ok) return res.status(400).json({ error: "invalid_tag", reason: v.reason, requestId: req.requestId });
+  if (cacheKey && method === 'GET') {
+    cacheSet(cacheKey, payload)
+  }
 
-  const tag = encodeTag(req.params.tag);
-  return cocFetch(`/clans/${tag}/members`, req, res, { cacheKey: `members:${tag}` });
-}));
+  return payload
+}
 
-// Aggregated clan statistics (derived server-side)
+// ==== Health & meta ====
+
+app.get('/health', (req, res) => {
+  res.json({ ok: true, uptime: process.uptime(), requestId: req.requestId })
+})
+
+// ==== Core Clash of Clans proxy endpoints ====
+
+// Search clans
+// GET /search/clans?name=...&limit=...
+app.get(
+  '/search/clans',
+  wrap(async (req, res) => {
+    const params = new URLSearchParams()
+    if (req.query.name) params.set('name', req.query.name)
+    if (req.query.limit) params.set('limit', req.query.limit)
+
+    const path = `/clans?${params.toString()}`
+    return cocFetch(path, req, res, {
+      cacheKey: `search:clans:${params.toString()}`,
+    })
+  })
+)
+
+// GET /clan/:tag
+app.get(
+  '/clan/:tag',
+  wrap(async (req, res) => {
+    const v = validateTagParam(req.params.tag)
+    if (!v.ok) {
+      return res.status(400).json({
+        error: 'invalid_tag',
+        reason: v.reason,
+        requestId: req.requestId,
+      })
+    }
+
+    const tag = encodeTag(req.params.tag)
+    return cocFetch(`/clans/${tag}`, req, res, {
+      cacheKey: `clan:${tag}`,
+    })
+  })
+)
+
+// GET /clan/:tag/members
+app.get(
+  '/clan/:tag/members',
+  wrap(async (req, res) => {
+    const v = validateTagParam(req.params.tag)
+    if (!v.ok) {
+      return res.status(400).json({
+        error: 'invalid_tag',
+        reason: v.reason,
+        requestId: req.requestId,
+      })
+    }
+
+    const tag = encodeTag(req.params.tag)
+    return cocFetch(`/clans/${tag}/members`, req, res, {
+      cacheKey: `clan:${tag}:members`,
+    })
+  })
+)
+
+// GET /clan/:tag/warlog
+app.get(
+  '/clan/:tag/warlog',
+  wrap(async (req, res) => {
+    const v = validateTagParam(req.params.tag)
+    if (!v.ok) {
+      return res.status(400).json({
+        error: 'invalid_tag',
+        reason: v.reason,
+        requestId: req.requestId,
+      })
+    }
+
+    const tag = encodeTag(req.params.tag)
+    return cocFetch(`/clans/${tag}/warlog`, req, res, {
+      cacheKey: `clan:${tag}:warlog`,
+    })
+  })
+)
+
+// GET /clan/:tag/currentwar
+app.get(
+  '/clan/:tag/currentwar',
+  wrap(async (req, res) => {
+    const v = validateTagParam(req.params.tag)
+    if (!v.ok) {
+      return res.status(400).json({
+        error: 'invalid_tag',
+        reason: v.reason,
+        requestId: req.requestId,
+      })
+    }
+
+    const tag = encodeTag(req.params.tag)
+    return cocFetch(`/clans/${tag}/currentwar`, req, res, {
+      cacheKey: `clan:${tag}:currentwar`,
+    })
+  })
+)
+
+// GET /player/:tag
+app.get(
+  '/player/:tag',
+  wrap(async (req, res) => {
+    const v = validateTagParam(req.params.tag)
+    if (!v.ok) {
+      return res.status(400).json({
+        error: 'invalid_tag',
+        reason: v.reason,
+        requestId: req.requestId,
+      })
+    }
+
+    const tag = encodeTag(req.params.tag)
+    return cocFetch(`/players/${tag}`, req, res, {
+      cacheKey: `player:${tag}`,
+    })
+  })
+)
+
+// NOTE: ❌ NO /player/:tag/battlelog here, because CoC API does not support it.
+
+// ==== Aggregated endpoints (custom) ====
+
+// GET /clan/:tag/stats
 app.get(
   '/clan/:tag/stats',
   wrap(async (req, res) => {
-    const tag = validateTagParam(req.params.tag);
-    // Fetch clan and members
-    const clanResp = await cocFetch(`/clans/${encodeTag(tag)}`, req, res, {
-      cacheKey: `clan:${tag}:info`,
-    });
-    const membersResp = await cocFetch(`/clans/${encodeTag(tag)}/members`, req, res, {
-      cacheKey: `clan:${tag}:members`,
-    });
-
-    // If upstream returned an error wrapper, forward it
-    if (!clanResp || !membersResp) {
-      return res.status(502).json({ error: 'Failed to fetch clan data' });
+    const rawTag = req.params.tag
+    const v = validateTagParam(rawTag)
+    if (!v.ok) {
+      return res.status(400).json({
+        error: 'invalid_tag',
+        reason: v.reason,
+        requestId: req.requestId,
+      })
     }
 
-    const clan = clanResp.data || {};
-    const members = membersResp.data?.items || [];
+    const tag = encodeTag(rawTag)
 
-    // Compute basic aggregated stats
-    const totalMembers = members.length;
-    const totalTrophies = members.reduce((s, m) => s + (m.trophies || 0), 0);
-    const avgTrophies = totalMembers > 0 ? Math.round(totalTrophies / totalMembers) : 0;
-    const highest = totalMembers > 0 ? Math.max(...members.map((m) => m.trophies || 0)) : 0;
-    const lowest = totalMembers > 0 ? Math.min(...members.map((m) => m.trophies || 0)) : 0;
+    // Fetch clan + members
+    const clan = await cocGetJson(`/clans/${tag}`, {
+      cacheKey: `clan:${tag}:info`,
+    })
 
-    // Trophies distribution buckets
+    const membersPayload = await cocGetJson(`/clans/${tag}/members`, {
+      cacheKey: `clan:${tag}:members`,
+    })
+
+    const members = membersPayload.items || []
+    const totalMembers = members.length
+
+    const totalTrophies = members.reduce((sum, m) => sum + (m.trophies || 0), 0)
+    const avgTrophies = totalMembers > 0 ? Math.round(totalTrophies / totalMembers) : 0
+    const highest = totalMembers > 0 ? Math.max(...members.map((m) => m.trophies || 0)) : 0
+    const lowest = totalMembers > 0 ? Math.min(...members.map((m) => m.trophies || 0)) : 0
+
     const brackets = [
       { name: '3000+', min: 3000, count: 0 },
       { name: '2500-2999', min: 2500, max: 2999, count: 0 },
@@ -272,116 +394,105 @@ app.get(
       { name: '1500-1999', min: 1500, max: 1999, count: 0 },
       { name: '1000-1499', min: 1000, max: 1499, count: 0 },
       { name: '<1000', min: 0, max: 999, count: 0 },
-    ];
+    ]
 
     members.forEach((m) => {
-      const t = m.trophies || 0;
-      if (t >= 3000) brackets[0].count++;
-      else if (t >= 2500) brackets[1].count++;
-      else if (t >= 2000) brackets[2].count++;
-      else if (t >= 1500) brackets[3].count++;
-      else if (t >= 1000) brackets[4].count++;
-      else brackets[5].count++;
-    });
+      const t = m.trophies || 0
+      if (t >= 3000) brackets[0].count++
+      else if (t >= 2500) brackets[1].count++
+      else if (t >= 2000) brackets[2].count++
+      else if (t >= 1500) brackets[3].count++
+      else if (t >= 1000) brackets[4].count++
+      else brackets[5].count++
+    })
 
     return res.json({
-      clan: { tag: clan.tag, name: clan.name, level: clan.clanLevel },
+      clan: {
+        tag: clan.tag,
+        name: clan.name,
+        level: clan.clanLevel,
+        points: clan.clanPoints,
+        warWins: clan.warWins,
+      },
       totalMembers,
       avgTrophies,
       highest,
       lowest,
       trophyDistribution: brackets,
-    });
+      requestId: req.requestId,
+    })
   })
-);
+)
 
-// Clan donations aggregate
+// GET /clan/:tag/donations
 app.get(
   '/clan/:tag/donations',
   wrap(async (req, res) => {
-    const tag = validateTagParam(req.params.tag);
-    const membersResp = await cocFetch(`/clans/${encodeTag(tag)}/members`, req, res, {
-      cacheKey: `clan:${tag}:members`,
-    });
-
-    if (!membersResp) return res.status(502).json({ error: 'Failed to fetch members' });
-
-    const members = membersResp.data?.items || [];
-
-    const totalDonations = members.reduce((s, m) => s + (m.donations || 0) + (m.donated || 0), 0);
-    const perMember = members.map((m) => ({ tag: m.tag, name: m.name, donated: m.donated || 0, donations: m.donations || 0 }));
-
-    perMember.sort((a, b) => (b.donated || 0) - (a.donated || 0));
-
-    return res.json({ totalDonations, members: perMember });
-  })
-);
-
-app.get("/clan/:tag/warlog", wrap(async (req, res) => {
-  const v = validateTagParam(req.params.tag);
-  if (!v.ok) return res.status(400).json({ error: "invalid_tag", reason: v.reason, requestId: req.requestId });
-
-  const tag = encodeTag(req.params.tag);
-  return cocFetch(`/clans/${tag}/warlog`, req, res, { cacheKey: `warlog:${tag}` });
-}));
-
-app.get("/clan/:tag/currentwar", wrap(async (req, res) => {
-  const v = validateTagParam(req.params.tag);
-  if (!v.ok) return res.status(400).json({ error: "invalid_tag", reason: v.reason, requestId: req.requestId });
-
-  const tag = encodeTag(req.params.tag);
-  return cocFetch(`/clans/${tag}/currentwar`, req, res, { cacheKey: `currentwar:${tag}` });
-}));
-
-// Players
-app.get("/player/:tag", wrap(async (req, res) => {
-  const v = validateTagParam(req.params.tag);
-  if (!v.ok) return res.status(400).json({ error: "invalid_tag", reason: v.reason, requestId: req.requestId });
-
-  const tag = encodeTag(req.params.tag);
-  return cocFetch(`/players/${tag}`, req, res, { cacheKey: `player:${tag}` });
-}));
-
-app.get("/player/:tag/battlelog", wrap(async (req, res) => {
-  const v = validateTagParam(req.params.tag);
-  if (!v.ok) return res.status(400).json({ error: "invalid_tag", reason: v.reason, requestId: req.requestId });
-
-  const tag = encodeTag(req.params.tag);
-  return cocFetch(`/players/${tag}/battlelog`, req, res, { cacheKey: `battlelog:${tag}` });
-}));
-
-// Optional raw proxy (disabled by default for safety)
-if (ALLOW_RAW_PROXY) {
-  app.get("/raw/*", wrap(async (req, res) => {
-    const path = req.path.replace(/^\/raw/, "");
-    // basic sanitization
-    if (!/^[\w\-\/%\.]+$/.test(path)) {
-      return res.status(400).json({ error: "invalid_raw_path", requestId: req.requestId });
+    const rawTag = req.params.tag
+    const v = validateTagParam(rawTag)
+    if (!v.ok) {
+      return res.status(400).json({
+        error: 'invalid_tag',
+        reason: v.reason,
+        requestId: req.requestId,
+      })
     }
-    return cocFetch(path, req, res, { cacheKey: `raw:${path}:${req.originalUrl}` });
-  }));
+
+    const tag = encodeTag(rawTag)
+
+    const membersPayload = await cocGetJson(`/clans/${tag}/members`, {
+      cacheKey: `clan:${tag}:members`,
+    })
+
+    const members = membersPayload.items || []
+
+    const perMember = members.map((m) => ({
+      tag: m.tag,
+      name: m.name,
+      role: m.role,
+      donations: m.donations || 0,
+      donationsReceived: m.donationsReceived || 0,
+    }))
+
+    const totalDonations = perMember.reduce((sum, m) => sum + m.donations, 0)
+    const totalReceived = perMember.reduce((sum, m) => sum + m.donationsReceived, 0)
+
+    perMember.sort((a, b) => b.donations - a.donations)
+
+    return res.json({
+      totalDonations,
+      totalReceived,
+      members: perMember,
+      requestId: req.requestId,
+    })
+  })
+)
+
+// ==== Optional raw proxy (debug) ====
+// Enable with ALLOW_RAW_PROXY=true
+if (process.env.ALLOW_RAW_PROXY === 'true') {
+  app.get(
+    '/raw/*',
+    wrap(async (req, res) => {
+      const path = req.params[0]
+      const urlPart = path.startsWith('/') ? path : `/${path}`
+      return cocFetch(urlPart, req, res, { cacheKey: `raw:${urlPart}` })
+    })
+  )
 }
 
-// ---------- 404 handler ----------
-app.use((req, res) => {
-  res.status(404).json({ error: "not_found", path: req.originalUrl, requestId: req.requestId || null });
-});
-
-// ---------- central error handler ----------
+// ==== Error handler ====
 app.use((err, req, res, next) => {
-  const requestId = req.requestId || makeRequestId();
-  metrics.errors += 1;
-  errorLog(`[error] req=${requestId} err=`, err && err.stack ? err.stack : err);
-  const status = err && err.status ? err.status : 500;
-  const payload = {
-    error: err && err.code ? err.code : "internal_error",
-    message: err && err.message ? err.message : "Internal server error",
-    requestId,
-  };
-  res.status(status).json(payload);
-});
+  console.error('Unhandled error:', err)
+  const status = err.status || 500
+  res.status(status).json({
+    error: 'internal_error',
+    message: err.message || 'Unexpected server error',
+    requestId: req.requestId,
+  })
+})
 
-// ---------- start ----------
+// ==== Start server ====
 app.listen(PORT, () => {
-  info(`✅ Backend running on port ${PORT} (DEBUG=${DEBUG})`);
-});
+  console.log(`✅ Server listening on port ${PORT}`)
+})
