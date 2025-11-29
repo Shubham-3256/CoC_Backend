@@ -319,69 +319,113 @@ app.get("/forum/threads", (req, res) => {
   res.json({ threads: sorted })
 })
 
-// POST create new thread
-app.post("/forum/threads", (req, res) => {
-  const { title, content, author } = req.body || {}
+// POST create new thread (with optional playerTag)
+app.post(
+  "/forum/threads",
+  wrap(async (req, res) => {
+    const { title, content, author, playerTag } = req.body || {}
 
-  if (!title || !content) {
-    return res
-      .status(400)
-      .json({ message: "Title and content are required" })
-  }
+    if (!title || !content) {
+      return res
+        .status(400)
+        .json({ message: "Title and content are required" })
+    }
 
-  const thread = {
-    id: nextThreadId++,
-    title: title.trim(),
-    content: content.trim(),
-    author: (author || "Clan Member").trim(),
-    createdAt: new Date().toISOString(),
-    replies: [],
-  }
+    let effectiveAuthor = (author || "Clan Member").trim()
+    let authorTag = null
+    let authorTownHallLevel = null
+    let authorLeagueName = null
 
-  forumThreads.unshift(thread)
-  return res.status(201).json(thread)
-})
+    // If playerTag is provided, look up real player info
+    if (playerTag) {
+      try {
+        const encodedTag = encodeTag(playerTag)
+        const player = await cocGetJson(`/players/${encodedTag}`, {
+          cacheKey: null, // don't cache long-term, forum is low traffic anyway
+        })
 
-// GET single thread
-app.get("/forum/threads/:id", (req, res) => {
-  const id = Number(req.params.id)
-  const thread = forumThreads.find((t) => t.id === id)
+        effectiveAuthor = player.name || effectiveAuthor
+        authorTag = player.tag
+        authorTownHallLevel = player.townHallLevel
+        authorLeagueName = player.league?.name || null
+      } catch (err) {
+        console.warn("Failed to fetch player for forum thread:", err.message)
+      }
+    }
 
-  if (!thread) {
-    return res.status(404).json({ message: "Thread not found" })
-  }
+    const thread = {
+      id: nextThreadId++,
+      title: title.trim(),
+      content: content.trim(),
+      author: effectiveAuthor,
+      authorTag,
+      authorTownHallLevel,
+      authorLeagueName,
+      createdAt: new Date().toISOString(),
+      replies: [],
+    }
 
-  return res.json(thread)
-})
+    forumThreads.unshift(thread)
+    return res.status(201).json(thread)
+  })
+)
 
-// POST reply to a thread
-app.post("/forum/threads/:id/replies", (req, res) => {
-  const id = Number(req.params.id)
-  const { content, author } = req.body || {}
+// POST reply to a thread (with optional playerTag)
+app.post(
+  "/forum/threads/:id/replies",
+  wrap(async (req, res) => {
+    const id = Number(req.params.id)
+    const { content, author, playerTag } = req.body || {}
 
-  const thread = forumThreads.find((t) => t.id === id)
-  if (!thread) {
-    return res.status(404).json({ message: "Thread not found" })
-  }
+    const thread = forumThreads.find((t) => t.id === id)
+    if (!thread) {
+      return res.status(404).json({ message: "Thread not found" })
+    }
 
-  if (!content) {
-    return res
-      .status(400)
-      .json({ message: "Reply content is required" })
-  }
+    if (!content) {
+      return res
+        .status(400)
+        .json({ message: "Reply content is required" })
+    }
 
-  const reply = {
-    id: (thread.replies?.length || 0) + 1,
-    content: content.trim(),
-    author: (author || "Clan Member").trim(),
-    createdAt: new Date().toISOString(),
-  }
+    let replyAuthor = (author || "Clan Member").trim()
+    let authorTag = null
+    let authorTownHallLevel = null
+    let authorLeagueName = null
 
-  thread.replies = thread.replies || []
-  thread.replies.push(reply)
+    if (playerTag) {
+      try {
+        const encodedTag = encodeTag(playerTag)
+        const player = await cocGetJson(`/players/${encodedTag}`, {
+          cacheKey: null,
+        })
 
-  return res.status(201).json(reply)
-})
+        replyAuthor = player.name || replyAuthor
+        authorTag = player.tag
+        authorTownHallLevel = player.townHallLevel
+        authorLeagueName = player.league?.name || null
+      } catch (err) {
+        console.warn("Failed to fetch player for forum reply:", err.message)
+      }
+    }
+
+    const reply = {
+      id: (thread.replies?.length || 0) + 1,
+      content: content.trim(),
+      author: replyAuthor,
+      authorTag,
+      authorTownHallLevel,
+      authorLeagueName,
+      createdAt: new Date().toISOString(),
+    }
+
+    thread.replies = thread.replies || []
+    thread.replies.push(reply)
+
+    return res.status(201).json(reply)
+  })
+)
+
 
 // (Optional) delete thread
 app.delete("/forum/threads/:id", (req, res) => {
