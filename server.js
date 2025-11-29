@@ -25,7 +25,9 @@ app.use(morgan("dev"))
 
 // Add requestId for debugging
 app.use((req, res, next) => {
-  req.requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+  req.requestId = `${Date.now().toString(36)}-${Math.random()
+    .toString(36)
+    .slice(2)}`
   next()
 })
 
@@ -53,16 +55,15 @@ function validateTag(tag) {
 }
 
 function encodeTag(rawTag) {
-  if (!rawTag) return ''
+  if (!rawTag) return ""
 
   // Decode first so it works with "%23TAG" and "#TAG" and "TAG"
   let tag = decodeURIComponent(rawTag).trim().toUpperCase()
 
-  if (!tag.startsWith('#')) tag = `#${tag}`
+  if (!tag.startsWith("#")) tag = `#${tag}`
 
   return encodeURIComponent(tag)
 }
-
 
 function wrap(fn) {
   return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
@@ -73,6 +74,7 @@ async function fetchWithTimeout(url, options = {}, timeout = FETCH_TIMEOUT_MS) {
   const id = setTimeout(() => controller.abort(), timeout)
 
   try {
+    // NOTE: spread options correctly
     return await fetch(url, { ...options, signal: controller.signal })
   } finally {
     clearTimeout(id)
@@ -88,7 +90,10 @@ function parseJSON(text) {
 }
 
 // ---- Proxy Fetch returning JSON (aggregate routes use this) ----
-async function cocGetJson(path, { cacheKey = null, method = "GET", body = null } = {}) {
+async function cocGetJson(
+  path,
+  { cacheKey = null, method = "GET", body = null } = {}
+) {
   if (cacheKey && method === "GET") {
     const c = cacheGet(cacheKey)
     if (c) return c
@@ -161,52 +166,81 @@ async function cocFetch(path, req, res, { cacheKey = null }) {
 }
 
 // =======================================
+//       SIMPLE IN-MEMORY FORUM STORE
+// =======================================
+
+let forumThreads = []
+let nextThreadId = 1
+
+// =======================================
 //              API ROUTES
 // =======================================
 
 // Health-check
-app.get("/health", (req, res) => res.json({ ok: true, requestId: req.requestId }))
+app.get("/health", (req, res) =>
+  res.json({ ok: true, requestId: req.requestId })
+)
 
 // ----- Direct CoC API Proxy Endpoints -----
-app.get("/search/clans", wrap((req, res) => {
-  const p = new URLSearchParams(req.query).toString()
-  return cocFetch(`/clans?${p}`, req, res, { cacheKey: `search:${p}` })
-}))
-
-app.get("/clan/:tag", wrap((req, res) => {
-  const { tag } = req.params
-  const v = validateTag(tag)
-  if (!v.ok) return res.status(400).json(v)
-
-  return cocFetch(`/clans/${encodeTag(tag)}`, req, res, { cacheKey: `clan:${tag}` })
-}))
-
-app.get("/clan/:tag/members", wrap((req, res) => {
-  const { tag } = req.params
-  return cocFetch(`/clans/${encodeTag(tag)}/members`, req, res, {
-    cacheKey: `clan:${tag}:members`,
+app.get(
+  "/search/clans",
+  wrap((req, res) => {
+    const p = new URLSearchParams(req.query).toString()
+    return cocFetch(`/clans?${p}`, req, res, { cacheKey: `search:${p}` })
   })
-}))
+)
 
-app.get("/clan/:tag/warlog", wrap((req, res) => {
-  const { tag } = req.params
-  return cocFetch(`/clans/${encodeTag(tag)}/warlog`, req, res, {
-    cacheKey: `clan:${tag}:warlog`,
-  })
-}))
+app.get(
+  "/clan/:tag",
+  wrap((req, res) => {
+    const { tag } = req.params
+    const v = validateTag(tag)
+    if (!v.ok) return res.status(400).json(v)
 
-app.get("/clan/:tag/currentwar", wrap((req, res) => {
-  const { tag } = req.params
-  return cocFetch(`/clans/${encodeTag(tag)}/currentwar`, req, res, {
-    cacheKey: `clan:${tag}:currentwar`,
+    return cocFetch(`/clans/${encodeTag(tag)}`, req, res, {
+      cacheKey: `clan:${tag}`,
+    })
   })
-}))
+)
 
-app.get("/player/:tag", wrap((req, res) => {
-  return cocFetch(`/players/${encodeTag(req.params.tag)}`, req, res, {
-    cacheKey: `player:${req.params.tag}`,
+app.get(
+  "/clan/:tag/members",
+  wrap((req, res) => {
+    const { tag } = req.params
+    return cocFetch(`/clans/${encodeTag(tag)}/members`, req, res, {
+      cacheKey: `clan:${tag}:members`,
+    })
   })
-}))
+)
+
+app.get(
+  "/clan/:tag/warlog",
+  wrap((req, res) => {
+    const { tag } = req.params
+    return cocFetch(`/clans/${encodeTag(tag)}/warlog`, req, res, {
+      cacheKey: `clan:${tag}:warlog`,
+    })
+  })
+)
+
+app.get(
+  "/clan/:tag/currentwar",
+  wrap((req, res) => {
+    const { tag } = req.params
+    return cocFetch(`/clans/${encodeTag(tag)}/currentwar`, req, res, {
+      cacheKey: `clan:${tag}:currentwar`,
+    })
+  })
+)
+
+app.get(
+  "/player/:tag",
+  wrap((req, res) => {
+    return cocFetch(`/players/${encodeTag(req.params.tag)}`, req, res, {
+      cacheKey: `player:${req.params.tag}`,
+    })
+  })
+)
 
 // NOTE ❌ NO /player/:tag/battlelog (not in official API)
 
@@ -215,57 +249,152 @@ app.get("/player/:tag", wrap((req, res) => {
 // =======================================
 
 // ----- Donation Aggregation -----
-app.get("/clan/:tag/donations", wrap(async (req, res) => {
-  const tag = encodeTag(req.params.tag)
+app.get(
+  "/clan/:tag/donations",
+  wrap(async (req, res) => {
+    const tag = encodeTag(req.params.tag)
 
-  const members = await cocGetJson(`/clans/${tag}/members`, {
-    cacheKey: `clan:${tag}:members`,
+    const members = await cocGetJson(`/clans/${tag}/members`, {
+      cacheKey: `clan:${tag}:members`,
+    })
+
+    const list = (members.items || []).map((m) => ({
+      name: m.name,
+      tag: m.tag,
+      role: m.role,
+      donations: m.donations || 0,
+      received: m.donationsReceived || 0,
+    }))
+
+    const total = list.reduce((s, m) => s + m.donations, 0)
+
+    return res.json({
+      total,
+      members: list.sort((a, b) => b.donations - a.donations),
+      requestId: req.requestId,
+    })
   })
-
-  const list = (members.items || []).map(m => ({
-    name: m.name,
-    tag: m.tag,
-    role: m.role,
-    donations: m.donations || 0,
-    received: m.donationsReceived || 0,
-  }))
-
-  const total = list.reduce((s, m) => s + m.donations, 0)
-
-  return res.json({
-    total,
-    members: list.sort((a, b) => b.donations - a.donations),
-    requestId: req.requestId,
-  })
-}))
+)
 
 // ----- Stats Aggregation -----
-app.get("/clan/:tag/stats", wrap(async (req, res) => {
-  const tag = encodeTag(req.params.tag)
+app.get(
+  "/clan/:tag/stats",
+  wrap(async (req, res) => {
+    const tag = encodeTag(req.params.tag)
 
-  const clan = await cocGetJson(`/clans/${tag}`, { cacheKey: `clan:${tag}` })
-  const members = await cocGetJson(`/clans/${tag}/members`, {
-    cacheKey: `clan:${tag}:members`,
+    const clan = await cocGetJson(`/clans/${tag}`, { cacheKey: `clan:${tag}` })
+    const members = await cocGetJson(`/clans/${tag}/members`, {
+      cacheKey: `clan:${tag}:members`,
+    })
+
+    const list = members.items || []
+    const count = list.length
+
+    const totalTrophies = list.reduce((s, m) => s + (m.trophies || 0), 0)
+
+    return res.json({
+      clan: {
+        tag: clan.tag,
+        name: clan.name,
+        level: clan.clanLevel,
+      },
+      totalMembers: count,
+      avgTrophies: count ? Math.round(totalTrophies / count) : 0,
+      highest: count ? Math.max(...list.map((m) => m.trophies || 0)) : 0,
+      lowest: count ? Math.min(...list.map((m) => m.trophies || 0)) : 0,
+      requestId: req.requestId,
+    })
   })
+)
 
-  const list = members.items || []
-  const count = list.length
+// =======================================
+//           FORUM ENDPOINTS
+// =======================================
 
-  const totalTrophies = list.reduce((s, m) => s + (m.trophies || 0), 0)
+// GET all threads
+app.get("/forum/threads", (req, res) => {
+  const sorted = [...forumThreads].sort(
+    (a, b) => new Date(b.createdAt) - new Date(a.createdAt)
+  )
+  res.json({ threads: sorted })
+})
 
-  return res.json({
-    clan: {
-      tag: clan.tag,
-      name: clan.name,
-      level: clan.clanLevel,
-    },
-    totalMembers: count,
-    avgTrophies: count ? Math.round(totalTrophies / count) : 0,
-    highest: count ? Math.max(...list.map(m => m.trophies || 0)) : 0,
-    lowest: count ? Math.min(...list.map(m => m.trophies || 0)) : 0,
-    requestId: req.requestId,
-  })
-}))
+// POST create new thread
+app.post("/forum/threads", (req, res) => {
+  const { title, content, author } = req.body || {}
+
+  if (!title || !content) {
+    return res
+      .status(400)
+      .json({ message: "Title and content are required" })
+  }
+
+  const thread = {
+    id: nextThreadId++,
+    title: title.trim(),
+    content: content.trim(),
+    author: (author || "Clan Member").trim(),
+    createdAt: new Date().toISOString(),
+    replies: [],
+  }
+
+  forumThreads.unshift(thread)
+  return res.status(201).json(thread)
+})
+
+// GET single thread
+app.get("/forum/threads/:id", (req, res) => {
+  const id = Number(req.params.id)
+  const thread = forumThreads.find((t) => t.id === id)
+
+  if (!thread) {
+    return res.status(404).json({ message: "Thread not found" })
+  }
+
+  return res.json(thread)
+})
+
+// POST reply to a thread
+app.post("/forum/threads/:id/replies", (req, res) => {
+  const id = Number(req.params.id)
+  const { content, author } = req.body || {}
+
+  const thread = forumThreads.find((t) => t.id === id)
+  if (!thread) {
+    return res.status(404).json({ message: "Thread not found" })
+  }
+
+  if (!content) {
+    return res
+      .status(400)
+      .json({ message: "Reply content is required" })
+  }
+
+  const reply = {
+    id: (thread.replies?.length || 0) + 1,
+    content: content.trim(),
+    author: (author || "Clan Member").trim(),
+    createdAt: new Date().toISOString(),
+  }
+
+  thread.replies = thread.replies || []
+  thread.replies.push(reply)
+
+  return res.status(201).json(reply)
+})
+
+// (Optional) delete thread
+app.delete("/forum/threads/:id", (req, res) => {
+  const id = Number(req.params.id)
+  const index = forumThreads.findIndex((t) => t.id === id)
+
+  if (index === -1) {
+    return res.status(404).json({ message: "Thread not found" })
+  }
+
+  forumThreads.splice(index, 1)
+  return res.status(204).end()
+})
 
 // =======================================
 //        ERROR HANDLER + START
